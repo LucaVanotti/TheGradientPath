@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 """
-Text-to-SQL Agent with Vector Embeddings Support
-Professional agent for converting natural language queries to SQL using OpenAI GPT models.
+Text-to-SQL Agent for local LLM usage.
+Professional agent for converting natural language queries to SQL using Ollama models.
 """
 
 import os
+import re
 import json
 import logging
+import requests
 import psycopg2
 import psycopg2.extensions
 import sqlglot
 import traceback
 from typing import Dict, Any, List, Optional
-from openai import OpenAI
 from dotenv import load_dotenv
 from utils import generate_db_schema
 from prompt import (
     create_text_to_sql_prompt, 
     create_final_answer_prompt, 
     create_sql_retry_prompt,
+    create_sql_retry_prompt_for_phase,
     create_final_answer_user_message
 )
 
@@ -29,62 +31,67 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Embedding model configuration
-EMBEDDING_MODEL = "text-embedding-3-small"
-EMBEDDING_DIMENSIONS = 1536
+DEFAULT_LOCAL_MODEL = "qwen3:4b-instruct"
+DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
+DEFAULT_BROAD_RESULT_THRESHOLD = 200
 
 
 class AgentTextToSql:
     """
     Professional Text-to-SQL Agent that converts natural language queries to SQL.
     
-    This agent uses OpenAI's GPT models to understand user intent and generate
-    accurate SQL queries based on the database schema. It supports vector embeddings
-    for semantic search capabilities.
+    This agent uses a local Ollama model to understand user intent and generate
+    accurate SQL queries based on the database schema.
     """
     
     # Default database configuration
     DEFAULT_DB_CONFIG = {
         'host': 'localhost',
         'port': 5432,
-        'database': 'books_db',
+        'database': 'offerte_ristorazione',
         'user': 'bookadmin',
         'password': 'bookpass123'
     }
     
-    def __init__(self, db_config: Dict[str, Any] = None, model: str = "gpt-4.1", temperature: float = 0.1):
+    def __init__(self, db_config: Dict[str, Any] = None, model: str = DEFAULT_LOCAL_MODEL, temperature: float = 0.0):
         """
         Initialize the Text-to-SQL Agent.
         
         Args:
             db_config: Database configuration dictionary (optional, uses default if not provided)
-            model: OpenAI model to use (default: gpt-4.1)
-            temperature: Model temperature for response generation (default: 0.1 for consistency)
+            model: Ollama model to use (default: qwen3:4b-instruct)
+            temperature: Model temperature for response generation (default: 0.0 for consistency)
         """
-        self.model = model
+        self.model = os.getenv("LLM_MODEL", model)
         self.temperature = temperature
-        self.client = None
+        self.ollama_base_url = os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL).rstrip("/")
+        self.broad_result_threshold = int(os.getenv("BROAD_RESULT_THRESHOLD", str(DEFAULT_BROAD_RESULT_THRESHOLD)))
         self.database_schema = None
-        self.db_config = db_config or self.DEFAULT_DB_CONFIG
+        if db_config:
+            self.db_config = db_config
+        else:
+            # Allow environment overrides while keeping working local defaults.
+            self.db_config = {
+                'host': os.getenv('PGHOST', self.DEFAULT_DB_CONFIG['host']),
+                'port': int(os.getenv('PGPORT', str(self.DEFAULT_DB_CONFIG['port']))),
+                'database': os.getenv('PGDATABASE', self.DEFAULT_DB_CONFIG['database']),
+                'user': os.getenv('PGUSER', self.DEFAULT_DB_CONFIG['user']),
+                'password': os.getenv('PGPASSWORD', self.DEFAULT_DB_CONFIG['password'])
+            }
         
-        # Initialize OpenAI client
-        self._initialize_openai_client()
+        # Initialize local LLM settings
+        self._initialize_llm_client()
         
         # Load database schema
         self._load_database_schema()
     
-    def _initialize_openai_client(self) -> None:
-        """Initialize OpenAI client with API key from environment."""
-        api_key = os.getenv('OPENAI_API_KEY')
-        
-        if not api_key:
-            raise ValueError(
-                "OPENAI_API_KEY not found in environment variables. "
-                "Please add your OpenAI API key to the .env file."
-            )
-        
-        self.client = OpenAI(api_key=api_key)
-        logger.info(f"OpenAI client initialized with model: {self.model}")
+    def _initialize_llm_client(self) -> None:
+        """Initialize local LLM settings (Ollama)."""
+        logger.info(
+            "Using local Ollama model '%s' at %s",
+            self.model,
+            self.ollama_base_url,
+        )
     
     def _load_database_schema(self) -> None:
         """Generate database schema directly from database using utils."""
@@ -110,9 +117,58 @@ class AgentTextToSql:
         Create the system prompt for the Text-to-SQL agent.
         
         Returns:
-            str: System prompt for OpenAI API
+            str: System prompt for LLM API
         """
         return create_text_to_sql_prompt(self.database_schema)
+
+    def _extract_json_object(self, text: str) -> Dict[str, Any]:
+        """Extract a JSON object from model output, handling code fences if present."""
+        cleaned = text.strip()
+
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+            if not match:
+                raise
+            return json.loads(match.group(0))
+
+    def _call_local_llm(self, system_prompt: str, user_prompt: str, temperature: float, expect_json: bool) -> str:
+        """Call Ollama chat endpoint and return model text."""
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "stream": False,
+            "options": {
+                "temperature": temperature,
+                "num_predict": 1200,
+            },
+        }
+
+        if expect_json:
+            payload["format"] = "json"
+
+        response = requests.post(
+            f"{self.ollama_base_url}/api/chat",
+            json=payload,
+            timeout=120,
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        message = data.get("message", {})
+        content = message.get("content", "")
+        if not content:
+            raise ValueError("Empty response from local model")
+
+        return content
 
     def generate_sql(self, user_request: str) -> Dict[str, Any]:
         """
@@ -130,21 +186,16 @@ class AgentTextToSql:
             # Create system prompt
             system_prompt = self._create_system_prompt()
             
-            # Make API call to OpenAI
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_request}
-                ],
+            # Make API call to local model
+            response_text = self._call_local_llm(
+                system_prompt=system_prompt,
+                user_prompt=user_request,
                 temperature=self.temperature,
-                max_tokens=1000,
-                response_format={"type": "json_object"}
+                expect_json=True,
             )
-            
+
             # Extract and parse JSON response
-            response_text = response.choices[0].message.content.strip()
-            result = json.loads(response_text)
+            result = self._extract_json_object(response_text)
             
             # Validate response structure
             required_fields = ["sql_query", "need_embedding", "embedding_params"]
@@ -240,7 +291,7 @@ class AgentTextToSql:
     
     def _generate_embedding(self, text: str) -> List[float]:
         """
-        Generate embedding for a single text using OpenAI API.
+        Generate embedding for a single text.
         
         Args:
             text: Text to generate embedding for
@@ -248,22 +299,10 @@ class AgentTextToSql:
         Returns:
             List of floats representing the embedding vector
         """
-        if not text or not text.strip():
-            raise ValueError("Cannot generate embedding for empty text")
-        
-        try:
-            response = self.client.embeddings.create(
-                model=EMBEDDING_MODEL,
-                input=text,
-                dimensions=EMBEDDING_DIMENSIONS
-            )
-            
-            embedding = response.data[0].embedding
-            return embedding
-            
-        except Exception as e:
-            logger.error(f"Error generating embedding: {str(e)}")
-            raise
+        raise NotImplementedError(
+            "Embedding generation is disabled in local MVP mode. "
+            "Set need_embedding=false and embedding_params=[] in prompts."
+        )
     
     def _generate_embeddings_for_params(self, embedding_params: List[Dict[str, str]]) -> List[str]:
         """
@@ -564,6 +603,14 @@ class AgentTextToSql:
         """
         try:
             logger.info("Generating final natural language answer...")
+
+            # For list/order requests, return a deterministic compact list without extra feature prose.
+            if (
+                query_results.get('success', False)
+                and query_results.get('row_count', 0) > 0
+                and self._is_list_or_order_request(user_request)
+            ):
+                return self._format_ordered_list_answer(user_request, query_results)
             
             # Prepare the results summary
             if not query_results.get('success', False):
@@ -589,22 +636,58 @@ class AgentTextToSql:
             user_message = create_final_answer_user_message(user_request, results_text, sql_query)
             
             # Make API call to generate answer
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message}
-                ],
-                temperature=0.3,  # Slightly higher for more natural responses
-                max_tokens=1000
-            )
-            
-            answer = response.choices[0].message.content.strip()
+            answer = self._call_local_llm(
+                system_prompt=system_prompt,
+                user_prompt=user_message,
+                temperature=0.3,
+                expect_json=False,
+            ).strip()
             return answer
             
         except Exception as e:
             logger.error(f"Error generating final answer: {str(e)}")
             return f"I apologize, but I encountered an error while generating the answer: {str(e)}"
+
+    def _is_list_or_order_request(self, user_request: str) -> bool:
+        """Detect requests that explicitly ask for list/elenco and/or sorted ordering."""
+        text = (user_request or "").lower()
+        markers = [
+            "lista",
+            "elenca",
+            "elenco",
+            "mostrami",
+            "in ordine",
+            "ordine crescente",
+            "ordine decrescente",
+            "ordered",
+            "sorted",
+            "ascending",
+            "descending",
+        ]
+        return any(marker in text for marker in markers)
+
+    def _format_ordered_list_answer(self, user_request: str, query_results: Dict[str, Any]) -> str:
+        """Format query results as an ordered list with essential fields only."""
+        rows = query_results.get('results', [])
+        if not rows:
+            return "Non ho trovato risultati."
+
+        lines = [f"Ecco l'elenco in ordine richiesto ({len(rows)} risultati):"]
+        for idx, row in enumerate(rows, 1):
+            nome = row.get('nome', 'N/D')
+            fornitore = row.get('fornitore', 'N/D')
+            codice = row.get('codice', 'N/D')
+            prezzo = row.get('prezzo')
+            cliente = row.get('cliente')
+
+            prezzo_str = "N/D" if prezzo is None else str(prezzo)
+
+            item = f"{idx}. {nome} | fornitore: {fornitore} | codice: {codice} | prezzo: {prezzo_str}"
+            if cliente:
+                item += f" | cliente: {cliente}"
+            lines.append(item)
+
+        return "\n".join(lines)
     
     def _regenerate_sql_with_error_feedback(self, user_request: str, 
                                               attempt_history: List[Dict[str, str]], 
@@ -634,25 +717,23 @@ SQL Query: {prev_attempt['sql']}
 Error: {prev_attempt['error']}
 ---"""
         
-        # Create user message using prompt function
-        user_message = create_sql_retry_prompt(user_request, error_history_text)
+        # Create user message using a phase-specific retry prompt for deterministic broadening.
+        if attempt >= 2:
+            user_message = create_sql_retry_prompt_for_phase(user_request, error_history_text, attempt)
+        else:
+            user_message = create_sql_retry_prompt(user_request, error_history_text)
         
         try:
-            # Make API call to OpenAI
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message}
-                ],
+            # Make API call to local model
+            response_text = self._call_local_llm(
+                system_prompt=system_prompt,
+                user_prompt=user_message,
                 temperature=self.temperature,
-                max_tokens=1000,
-                response_format={"type": "json_object"}
+                expect_json=True,
             )
-            
+
             # Extract and parse JSON response
-            response_text = response.choices[0].message.content.strip()
-            result = json.loads(response_text)
+            result = self._extract_json_object(response_text)
             
             # Validate response structure
             required_fields = ["sql_query", "need_embedding", "embedding_params"]
@@ -742,7 +823,44 @@ Error: {prev_attempt['error']}
                     
                     # Continue to next attempt
                     continue
+
+                # Stop fallback if broadening has already produced a very large candidate set.
+                if query_results.get('row_count', 0) >= self.broad_result_threshold and attempt < max_retries:
+                    logger.warning(
+                        "Attempt %s produced %s rows (threshold=%s). "
+                        "Stopping retries to avoid over-broad filtering.",
+                        attempt,
+                        query_results.get('row_count', 0),
+                        self.broad_result_threshold,
+                    )
+                    query_results['is_broad_result'] = True
+                    query_results['broad_result_threshold'] = self.broad_result_threshold
+                    
+                    # Continue to final answer generation without further retries.
+                    
                 
+                
+                # If query executed but returned no rows, retry with no-results feedback.
+                if query_results.get('row_count', 0) == 0 and attempt < max_retries:
+                    retry_phase = min(attempt + 1, max_retries)
+                    no_results_error = (
+                        "Query executed successfully but returned 0 rows. "
+                        f"Apply hard-coded fallback phase for next attempt={retry_phase}. "
+                        "Use progressively broader filtering: split long phrase constraints, reduce strict AND "
+                        "chains, keep core product terms, and broaden ILIKE predicates across "
+                        "nome/descrizione/specifiche."
+                    )
+                    logger.warning(
+                        "Attempt %s returned 0 rows. Retrying with phase-based broader strategy (next attempt=%s).",
+                        attempt,
+                        retry_phase,
+                    )
+                    attempt_history.append({
+                        'sql': sql_result['sql_query'],
+                        'error': no_results_error
+                    })
+                    continue
+
                 # Step 3: Generate final answer (only if execution succeeded)
                 logger.info("=" * 80)
                 logger.info("STEP 3: GENERATING FINAL ANSWER")

@@ -9,7 +9,7 @@ services:
       # Database credentials
       POSTGRES_USER: bookadmin
       POSTGRES_PASSWORD: bookpass123
-      POSTGRES_DB: books_db
+      POSTGRES_DB: offerte_ristorazione
     ports:
       # Expose PostgreSQL on port 5432
       - "5432:5432"
@@ -19,7 +19,7 @@ services:
       # Persist data
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U bookadmin -d books_db"]
+      test: ["CMD-SHELL", "pg_isready -U bookadmin -d offerte_ristorazione"]
       interval: 10s
       timeout: 5s
       retries: 5

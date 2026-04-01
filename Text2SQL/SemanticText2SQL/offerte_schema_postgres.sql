@@ -1,9 +1,4 @@
--- ============================================================================
--- OFFERS DATABASE SCHEMA (MVP FOR TEXT2SQL)
--- ============================================================================
-
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-CREATE EXTENSION IF NOT EXISTS "fuzzystrmatch";
+-- PostgreSQL schema for migrated SQLite table `prodotti`
 
 CREATE TABLE IF NOT EXISTS prodotti (
     id TEXT PRIMARY KEY,

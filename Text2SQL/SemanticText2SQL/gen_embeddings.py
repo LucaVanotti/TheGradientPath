@@ -20,7 +20,7 @@ load_dotenv()
 DB_CONFIG = {
     'host': 'localhost',
     'port': 5432,
-    'database': 'books_db',
+    'database': 'offerte_ristorazione',
     'user': 'bookadmin',
     'password': 'bookpass123'
 }

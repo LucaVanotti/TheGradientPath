@@ -183,7 +183,8 @@ This is database interaction reimagined for the AI era. 🚀
 - Docker
 - Docker Compose
 - Python 3.8+ (for AI agent)
-- OpenAI API Key
+- Ollama installed locally
+- Ollama model: `qwen3:4b-instruct`
 
 ### Starting the Database
 
@@ -203,18 +204,18 @@ docker-compose logs -f
 **Connection Details:**
 - **Host:** localhost
 - **Port:** 5432
-- **Database:** books_db
+- **Database:** offerte_ristorazione
 - **Username:** bookadmin
 - **Password:** bookpass123
 
 **Using psql:**
 ```bash
-docker exec -it books_database psql -U bookadmin -d books_db
+docker exec -it books_database psql -U bookadmin -d offerte_ristorazione
 ```
 
 **Using connection string:**
 ```
-postgresql://bookadmin:bookpass123@localhost:5432/books_db
+postgresql://bookadmin:bookpass123@localhost:5432/offerte_ristorazione
 ```
 
 ### Stopping the Database
@@ -250,8 +251,15 @@ pip install -r requirements.txt
 Create a `.env` file in the project root:
 
 ```bash
-# OpenAI API Key (required)
-OPENAI_API_KEY=your_openai_api_key_here
+# Local LLM via Ollama
+OLLAMA_BASE_URL=http://localhost:11434
+LLM_MODEL=qwen3:4b-instruct
+```
+
+Download the model once:
+
+```bash
+ollama pull qwen3:4b-instruct
 ```
 
 ### Deactivating Virtual Environment
