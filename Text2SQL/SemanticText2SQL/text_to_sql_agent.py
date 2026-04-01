@@ -52,6 +52,53 @@ class AgentTextToSql:
         'user': 'bookadmin',
         'password': 'bookpass123'
     }
+
+    GENERIC_QUERY_TERMS = {
+        "macchina",
+        "macchine",
+        "prodotto",
+        "prodotti",
+        "articolo",
+        "articoli",
+        "elemento",
+        "elementi",
+        "capacità",
+        "capacita",
+        "capienza",
+        "dimensione",
+        "dimensioni",
+        "tipo",
+        "tipologia",
+        "categoria",
+        "potenza",
+        "funzione",
+        "funzioni",
+        "tensione",
+        "corrente",
+        "materiale",
+        "materiali",
+        "colore",
+        "sopra",
+        "sotto",
+        "vicino",
+        "piu",
+        "più",
+        "meno",
+        "grande",
+        "grandi"
+        "LT", 
+        "litri",
+        "cm",
+        "centimetri",
+        "mm",
+        "millimetri",
+        "kg",
+        "chilogrammi",
+        "g",
+        "grammi",
+        "m",
+        "metri"
+    }
     
     def __init__(self, db_config: Dict[str, Any] = None, model: str = DEFAULT_LOCAL_MODEL, temperature: float = 0.0):
         """
@@ -170,6 +217,264 @@ class AgentTextToSql:
 
         return content
 
+    def _sanitize_user_request_for_sql(self, user_request: str) -> str:
+        """
+        Remove generic low-signal terms from user request before SQL generation.
+
+        This avoids over-constraining queries with words like "macchine" that are
+        too generic and often reduce recall.
+        """
+        if not user_request:
+            return user_request
+
+        tokens = user_request.split()
+        cleaned_tokens: List[str] = []
+        for token in tokens:
+            normalized = re.sub(r"[^\w]", "", token, flags=re.UNICODE).lower()
+            if normalized in self.GENERIC_QUERY_TERMS:
+                continue
+            cleaned_tokens.append(token)
+
+        sanitized = " ".join(cleaned_tokens).strip()
+        if sanitized and sanitized != user_request:
+            logger.info("Sanitized user request for SQL generation: %s", sanitized)
+            return sanitized
+
+        return user_request
+
+    def _enforce_specifiche_descrizione_pairing(self, sql_query: str) -> str:
+        """
+        Enforce a hard-coded rule for text filters:
+        every `specifiche ILIKE '...` predicate must also include the same
+        token on `descrizione` with an OR clause.
+
+        This normalization is intentionally deterministic to avoid relying
+        only on model compliance.
+        """
+        pattern = re.compile(r"(?<![\w.])specifiche\s+ILIKE\s+'((?:''|[^'])*)'", flags=re.IGNORECASE)
+
+        def _replace(match: re.Match) -> str:
+            literal = match.group(1)
+            if re.search(rf"descrizione\s+ILIKE\s+'{re.escape(literal)}'", sql_query, flags=re.IGNORECASE):
+                return match.group(0)
+            return f"(specifiche ILIKE '{literal}' OR descrizione ILIKE '{literal}')"
+
+        normalized = pattern.sub(_replace, sql_query)
+        if normalized != sql_query:
+            logger.info("Applied hard-coded specifiche/descrizione pairing normalization")
+        return normalized
+
+    def _build_double_letter_tolerant_regex(self, like_literal: str) -> str:
+        """
+        Build a PostgreSQL regex pattern tolerant to double-letter mismatches.
+
+        Example:
+            '%cappottina%' -> '.*c+a+p+o+t+i+n+a+.*'
+        """
+        core = like_literal.replace('%', '').strip()
+        if not core:
+            return ""
+
+        # Collapse consecutive duplicates first (e.g. cappottina -> capotina),
+        # then allow one-or-more per character in regex.
+        collapsed_chars: List[str] = []
+        prev_char: str | None = None
+        for ch in core:
+            if prev_char is not None and ch.lower() == prev_char.lower() and ch.isalpha() and prev_char.isalpha():
+                continue
+            collapsed_chars.append(ch)
+            prev_char = ch
+
+        parts: List[str] = []
+        prev_kind: str | None = None
+        for ch in collapsed_chars:
+            if ch.isdigit():
+                curr_kind = "digit"
+            elif ch.isalpha():
+                curr_kind = "alpha"
+            elif ch.isspace():
+                curr_kind = "space"
+            else:
+                curr_kind = "other"
+
+            # Allow optional spacing between numeric and alphabetic boundaries:
+            # this makes 35cm match 35 cm (and vice versa).
+            if prev_kind in {"digit", "alpha"} and curr_kind in {"digit", "alpha"} and prev_kind != curr_kind:
+                parts.append(r"\s*")
+
+            if ch.isspace():
+                parts.append(r"\s+")
+            elif ch.isalpha():
+                parts.append(re.escape(ch) + "+")
+            else:
+                parts.append(re.escape(ch))
+
+            prev_kind = curr_kind
+
+        return ".*" + "".join(parts) + ".*"
+
+    def _build_morph_variants(self, core_token: str) -> List[str]:
+        """
+        Build lightweight Italian morphological variants for a single token.
+
+        This is intentionally generic and rule-based (no word-specific dictionaries).
+        """
+        token = (core_token or "").lower().strip()
+        if not token or not re.fullmatch(r"[a-zA-Z]+", token):
+            return []
+
+        variants = {token}
+
+        # Agentive noun alternation (e.g., friggitore <-> friggitrice)
+        if token.endswith("tore") and len(token) > 5:
+            stem = token[:-4]
+            variants.update({stem + "trice", stem + "tori", stem + "trici"})
+        elif token.endswith("trice") and len(token) > 6:
+            stem = token[:-5]
+            variants.update({stem + "tore", stem + "tori", stem + "trici"})
+
+        # Generic gender/number alternation for common endings.
+        if token.endswith("o") and len(token) > 3:
+            stem = token[:-1]
+            variants.update({stem + "a", stem + "i", stem + "e"})
+        elif token.endswith("a") and len(token) > 3:
+            stem = token[:-1]
+            variants.update({stem + "o", stem + "e", stem + "i"})
+        elif token.endswith("i") and len(token) > 3:
+            stem = token[:-1]
+            variants.update({stem + "o", stem + "a", stem + "e"})
+        elif token.endswith("e") and len(token) > 3:
+            stem = token[:-1]
+            variants.update({stem + "a", stem + "o", stem + "i"})
+
+        return sorted(variants)
+
+    def _enforce_double_letter_tolerant_matching(self, sql_query: str) -> str:
+        """
+        Enforce generic typo tolerance for doubled letters on all ILIKE predicates.
+
+        For each `field ILIKE '...` clause, add an OR regex fallback that accepts
+        one-or-more occurrences for letters, improving matches like single/double
+        consonant variations.
+        """
+        pattern = re.compile(
+            r"(?<![\w.])([A-Za-z_][\w.]*)\s+ILIKE\s+'((?:''|[^'])*)'",
+            flags=re.IGNORECASE,
+        )
+
+        def _replace(match: re.Match) -> str:
+            field = match.group(1)
+            literal = match.group(2)
+            core = literal.replace('%', '').strip()
+
+            # Skip very short tokens to avoid excessive broadening.
+            if len(core) < 4:
+                return match.group(0)
+
+            regex_pattern = self._build_double_letter_tolerant_regex(literal)
+            if not regex_pattern:
+                return match.group(0)
+
+            regex_patterns = [regex_pattern]
+
+            # Add generic morphology-aware alternatives for single-token alphabetic terms.
+            if re.fullmatch(r"[A-Za-z]+", core):
+                for variant in self._build_morph_variants(core):
+                    if variant == core:
+                        continue
+                    variant_pattern = self._build_double_letter_tolerant_regex(variant)
+                    if variant_pattern and variant_pattern not in regex_patterns:
+                        regex_patterns.append(variant_pattern)
+
+            sql_safe_regexes = [p.replace("'", "''") for p in regex_patterns]
+
+            # Avoid duplicating if a regex fallback for this field/literal already exists.
+            existing_regex = re.search(
+                rf"{re.escape(field)}\s+~\*\s+'.*{re.escape(sql_safe_regexes[0])}.*'",
+                sql_query,
+                flags=re.IGNORECASE,
+            )
+            if existing_regex:
+                return match.group(0)
+
+            regex_clause = " OR ".join(f"{field} ~* '{rx}'" for rx in sql_safe_regexes)
+            return f"({match.group(0)} OR {regex_clause})"
+
+        normalized = pattern.sub(_replace, sql_query)
+        if normalized != sql_query:
+            logger.info("Applied generic double-letter tolerant matching normalization")
+        return normalized
+
+    def _enforce_numeric_literal_cross_field_matching(self, sql_query: str) -> str:
+        """
+        Enforce cross-field matching for literals containing digits.
+
+        If a numeric literal is filtered only on specifiche/descrizione, expand it
+        to nome OR descrizione OR specifiche. This improves recall for dimensions
+        and capacities often stored in `nome` (e.g., 10LT, 35cm).
+        """
+        pattern = re.compile(
+            r"(?<![\w.])(specifiche|descrizione)\s+ILIKE\s+'((?:''|[^'])*)'",
+            flags=re.IGNORECASE,
+        )
+
+        def _replace(match: re.Match) -> str:
+            literal = match.group(2)
+            if not re.search(r"\d", literal):
+                return match.group(0)
+
+            # Avoid repeated expansion if already present for this literal.
+            already_expanded = re.search(
+                rf"nome\s+ILIKE\s+'{re.escape(literal)}'",
+                sql_query,
+                flags=re.IGNORECASE,
+            )
+            if already_expanded:
+                return match.group(0)
+
+            return (
+                f"(nome ILIKE '{literal}' OR descrizione ILIKE '{literal}' "
+                f"OR specifiche ILIKE '{literal}')"
+            )
+
+        normalized = pattern.sub(_replace, sql_query)
+        if normalized != sql_query:
+            logger.info("Applied numeric literal cross-field normalization")
+        return normalized
+
+    def _enforce_codice_in_list_select(self, sql_query: str, user_request: str) -> str:
+        """
+        Ensure `codice` is selected for list/order requests when applicable.
+
+        This keeps final answer formatting consistent and avoids N/D when codice
+        exists in DB but is not selected by the generated SQL.
+        """
+        if not self._is_list_or_order_request(user_request):
+            return sql_query
+
+        if not re.match(r"^\s*SELECT\b", sql_query, flags=re.IGNORECASE):
+            return sql_query
+
+        # Skip aggregate-style queries.
+        if re.search(r"\b(COUNT|SUM|AVG|MIN|MAX)\s*\(", sql_query, flags=re.IGNORECASE):
+            return sql_query
+
+        # SELECT * already includes codice.
+        if re.search(r"^\s*SELECT\s+\*\s+FROM\b", sql_query, flags=re.IGNORECASE):
+            return sql_query
+
+        from_match = re.search(r"\bFROM\b", sql_query, flags=re.IGNORECASE)
+        if not from_match:
+            return sql_query
+
+        select_part = sql_query[:from_match.start()]
+        if re.search(r"\bcodice\b", select_part, flags=re.IGNORECASE):
+            return sql_query
+
+        normalized = select_part.rstrip() + ", codice " + sql_query[from_match.start():]
+        logger.info("Applied list-select normalization: added codice to SELECT fields")
+        return normalized
+
     def generate_sql(self, user_request: str) -> Dict[str, Any]:
         """
         Generate SQL query from natural language request.
@@ -182,6 +487,7 @@ class AgentTextToSql:
         """
         try:
             logger.info(f"Processing user request: {user_request}")
+            sql_user_request = self._sanitize_user_request_for_sql(user_request)
             
             # Create system prompt
             system_prompt = self._create_system_prompt()
@@ -189,7 +495,7 @@ class AgentTextToSql:
             # Make API call to local model
             response_text = self._call_local_llm(
                 system_prompt=system_prompt,
-                user_prompt=user_request,
+                user_prompt=sql_user_request,
                 temperature=self.temperature,
                 expect_json=True,
             )
@@ -704,6 +1010,7 @@ class AgentTextToSql:
             Dict with regenerated SQL query
         """
         logger.info(f"Regenerating SQL query with error feedback from {len(attempt_history)} previous attempt(s)...")
+        sql_user_request = self._sanitize_user_request_for_sql(user_request)
         
         # Create system prompt
         system_prompt = self._create_system_prompt()
@@ -719,9 +1026,9 @@ Error: {prev_attempt['error']}
         
         # Create user message using a phase-specific retry prompt for deterministic broadening.
         if attempt >= 2:
-            user_message = create_sql_retry_prompt_for_phase(user_request, error_history_text, attempt)
+            user_message = create_sql_retry_prompt_for_phase(sql_user_request, error_history_text, attempt)
         else:
-            user_message = create_sql_retry_prompt(user_request, error_history_text)
+            user_message = create_sql_retry_prompt(sql_user_request, error_history_text)
         
         try:
             # Make API call to local model
@@ -792,6 +1099,10 @@ Error: {prev_attempt['error']}
                 logger.info("=" * 80)
                 logger.info("STEP 2: EXECUTING SQL QUERY")
                 logger.info("=" * 80)
+                sql_result['sql_query'] = self._enforce_codice_in_list_select(sql_result['sql_query'], user_request)
+                sql_result['sql_query'] = self._enforce_numeric_literal_cross_field_matching(sql_result['sql_query'])
+                sql_result['sql_query'] = self._enforce_double_letter_tolerant_matching(sql_result['sql_query'])
+                sql_result['sql_query'] = self._enforce_specifiche_descrizione_pairing(sql_result['sql_query'])
                 query_results = self.execute_sql(
                     sql_query=sql_result['sql_query'],
                     need_embedding=sql_result['need_embedding'],

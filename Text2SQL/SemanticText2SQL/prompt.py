@@ -37,6 +37,9 @@ QUERY STRATEGY:
 6. TWO-STAGE Search for complex requests:
      - Stage A: Filter by the core product noun (e.g., 'forno') using ILIKE on nome/descrizione.
      - Stage B: Add specific qualifiers (e.g., '6 teglie', 'vapore') using AND with separate ILIKE conditions.
+7. CRITICAL FIELD COUPLING: whenever you use specifiche in a text predicate, always pair it with descrizione using OR.
+    - Correct: (specifiche ILIKE '%teglie%' OR descrizione ILIKE '%teglie%')
+    - Avoid: specifiche ILIKE '%teglie%' alone
 
 FUZZY MATCHING RULES:
 - Thresholds for levenshtein:
@@ -199,10 +202,10 @@ PHASE RULES:
 - Increase recall significantly while preserving minimal semantic relevance.
 
 PHASE RULES:
-1. Keep only core noun + max 1-2 important qualifiers.
-2. Convert strict AND chains into broader OR groups where reasonable.
+1. Keep only core noun + max 1 important qualifiers.
+2. Convert strict AND chains into broader OR groups.
 3. Search across nome OR descrizione OR specifiche for each surviving token.
-4. Avoid levenshtein unless clearly useful; prioritize broad ILIKE matching first.
+4. Try levenshtein only if necessary for the most important token if it has no ILIKE matches.
 5. Keep ordering and LIMIT consistent and safe.
 """
     else:
@@ -234,6 +237,7 @@ GLOBAL RETRY CONSTRAINTS:
 3. need_embedding must stay false and embedding_params must stay [].
 4. Always include LIMIT (default 50, hard cap 100 unless user explicitly asks more).
 5. Generate one single valid PostgreSQL SELECT query.
+6. If a predicate uses specifiche, pair it with descrizione for the same token using OR.
 
 Return only JSON in the required format."""
 
